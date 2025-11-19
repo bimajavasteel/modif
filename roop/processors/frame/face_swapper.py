@@ -1,7 +1,3 @@
-# ============================================================
-#  face_swapper.py — Final Stable Multi-GPU Roop Patch (Dual GPU)
-# ============================================================
-
 from typing import Any, List, Callable, Tuple, Optional, Dict
 import cv2
 import insightface
@@ -19,6 +15,7 @@ from roop.typing import Face, Frame
 from roop.utilities import conditional_download, resolve_relative_path, is_image, is_video
 
 NAME = "ROOP.FACE-SWAPPER-DUAL-GPU"
+
 FACE_SWAPPER: Dict[int, Any] = {}
 THREAD_LOCK = threading.Lock()
 LANDMARK_FILTERS: Dict[str, Any] = {}
@@ -31,7 +28,7 @@ ONE_EURO_CONFIG = {
 }
 
 class OneEuroFilter:
-    def __init__(self, freq=30, min_cutoff=1, beta=0.0, d_cutoff=1.0):
+    def __init__(self, freq=30, min_cutoff=1.0, beta=0.0, d_cutoff=1.0):
         self.freq = float(freq)
         self.min_cutoff = float(min_cutoff)
         self.beta = float(beta)
@@ -80,7 +77,9 @@ def clear_face_swapper():
 
 def pre_check():
     download_directory_path = resolve_relative_path("../models")
-    conditional_download(download_directory_path, ["https://huggingface.co/datasets/OwlMaster/gg2/resolve/main/inswapper_128.onnx"])
+    conditional_download(download_directory_path, [
+        "https://huggingface.co/datasets/OwlMaster/gg2/resolve/main/inswapper_128.onnx"
+    ])
     return True
 
 def pre_start():
@@ -88,10 +87,10 @@ def pre_start():
         update_status("Select an image for source path.", NAME)
         return False
     if not get_one_face(cv2.imread(roop.globals.source_path)):
-        update_status("No face in source path.", NAME)
+        update_status("No face found in source.", NAME)
         return False
     if not is_image(roop.globals.target_path) and not is_video(roop.globals.target_path):
-        update_status("Select image/video for target.", NAME)
+        update_status("Invalid target path.", NAME)
         return False
     return True
 
@@ -103,11 +102,11 @@ def post_process():
 def safe_get_landmarks(face: Face):
     if face is None:
         return None
-    for key in ["landmark_2d_106", "landmark_2d", "kps", "landmarks"]:
-        if hasattr(face, key):
-            data = getattr(face, key)
-            if data is not None and len(data) > 0:
-                return np.asarray(data, dtype=float)
+    for attr in ["landmark_2d_106", "landmark_2d", "kps", "landmarks"]:
+        if hasattr(face, attr):
+            pts = getattr(face, attr)
+            if pts is not None and len(pts) > 0:
+                return np.asarray(pts, dtype=float)
     return None
 
 def get_filter_for_key(key: str):
@@ -121,36 +120,40 @@ def get_filter_for_key(key: str):
         )
     return LANDMARK_FILTERS[key]
 
-def smooth_landmarks(landmarks, key, timestamp):
+def smooth_landmarks(pts, key, ts):
     try:
-        if landmarks is None:
-            return landmarks
-        f = get_filter_for_key(key)
-        return f.filter(landmarks, timestamp)
+        if pts is None:
+            return pts
+        return get_filter_for_key(key).filter(pts, ts)
     except:
-        return landmarks
+        return pts
 
-def robust_face_alignment(source_face, target_face, frame, device_id=0):
+def robust_face_alignment(src_face, tgt_face, frame, gpu=0):
     try:
-        sl = safe_get_landmarks(source_face)
-        tl = safe_get_landmarks(target_face)
+        sl = safe_get_landmarks(src_face)
+        tl = safe_get_landmarks(tgt_face)
         if sl is None or tl is None:
             return frame, np.eye(2, 3, dtype=np.float32)
-        timestamp = time.time()
-        key_target = f"face_{getattr(target_face, 'face_index', 0)}" if roop.globals.many_faces else "reference"
-        sl = smooth_landmarks(sl, "source", timestamp)
-        tl = smooth_landmarks(tl, key_target, timestamp)
+
+        ts = time.time()
+        key = f"face_{getattr(tgt_face, 'face_index', 0)}" if roop.globals.many_faces else "reference"
+        sl = smooth_landmarks(sl, "source", ts)
+        tl = smooth_landmarks(tl, key, ts)
+
         if len(sl) < 3 or len(tl) < 3:
             return frame, np.eye(2, 3, dtype=np.float32)
+
         idx = list(range(min(5, len(sl))))
-        sp = np.array([sl[i] for i in idx], dtype=np.float32)
-        dp = np.array([tl[i] for i in idx], dtype=np.float32)
-        mat = cv2.estimateAffinePartial2D(sp, dp, method=cv2.LMEDS)[0]
-        if mat is None:
+        A = np.array([sl[i] for i in idx], dtype=np.float32)
+        B = np.array([tl[i] for i in idx], dtype=np.float32)
+
+        M = cv2.estimateAffinePartial2D(A, B, method=cv2.LMEDS)[0]
+        if M is None:
             return frame, np.eye(2, 3, dtype=np.float32)
+
         h, w = frame.shape[:2]
-        aligned = cv2.warpAffine(frame, mat, (w, h))
-        return aligned, mat
+        aligned = cv2.warpAffine(frame, M, (w, h))
+        return aligned, M
     except:
         return frame, np.eye(2, 3, dtype=np.float32)
 
@@ -163,89 +166,109 @@ def ensure_frame_format(f):
     except:
         return None
 
-def swap_face_optimized(source_face, target_face, frame, device_id):
+def swap_face_optimized(src_face, tgt_face, frame, gpu):
     try:
-        aligned, _ = robust_face_alignment(source_face, target_face, frame, device_id)
-        model = get_face_swapper(device_id)
-        out = model.get(aligned, target_face, source_face, paste_back=False)
+        aligned, _ = robust_face_alignment(src_face, tgt_face, frame, gpu)
+        model = get_face_swapper(gpu)
+        out = model.get(aligned, tgt_face, src_face, paste_back=False)
         out = ensure_frame_format(out)
         if out is None:
-            return model.get(frame, target_face, source_face, paste_back=True)
+            return model.get(frame, tgt_face, src_face, paste_back=True)
         return out
     except:
-        model = get_face_swapper(device_id)
-        return model.get(frame, target_face, source_face, paste_back=True)
+        model = get_face_swapper(gpu)
+        return model.get(frame, tgt_face, src_face, paste_back=True)
 
-def process_frame_single_gpu(source_face, reference_face, frame, device_id):
+def process_frame_single_gpu(src_face, ref_face, frame, gpu):
     try:
         if roop.globals.many_faces:
             faces = get_many_faces(frame)
             if faces:
-                for i, tf in enumerate(faces):
-                    setattr(tf, "face_index", i)
-                    frame = swap_face_optimized(source_face, tf, frame, device_id)
+                for i, f in enumerate(faces):
+                    setattr(f, "face_index", i)
+                    frame = swap_face_optimized(src_face, f, frame, gpu)
         else:
-            tf = find_similar_face(frame, reference_face)
-            if tf:
-                frame = swap_face_optimized(source_face, tf, frame, device_id)
+            f = find_similar_face(frame, ref_face)
+            if f:
+                frame = swap_face_optimized(src_face, f, frame, gpu)
     except:
         pass
     return frame
 
-def process_frames(source_path, temp_frame_paths, update):
+def process_frame(src_face, ref_face, frame):
     try:
-        source_face = get_one_face(cv2.imread(source_path))
-        reference_face = None if roop.globals.many_faces else get_face_reference()
+        gpus = roop.globals.gpu_device_ids
+        if not hasattr(process_frame, "_idx"):
+            process_frame._idx = 0
+        gpu = gpus[process_frame._idx]
+        process_frame._idx = (process_frame._idx + 1) % len(gpus)
+    except:
+        gpu = 0
+    return process_frame_single_gpu(src_face, ref_face, frame, gpu)
+
+def process_frames(source_path, frame_paths, update):
+    try:
+        src_face = get_one_face(cv2.imread(source_path))
+        ref_face = None if roop.globals.many_faces else get_face_reference()
+
         start_gpu_workers(process_frame_single_gpu)
-        gpu_ids = roop.globals.gpu_device_ids or [0]
+
+        gpus = roop.globals.gpu_device_ids
         idx = 0
-        for f in temp_frame_paths:
-            gpu = gpu_ids[idx]
-            roop.globals.gpu_job_queue[gpu].put((f, source_face, reference_face))
-            idx = (idx + 1) % len(gpu_ids)
-        for gpu in gpu_ids:
+
+        for p in frame_paths:
+            gpu = gpus[idx]
+            roop.globals.gpu_job_queue[gpu].put((p, src_face, ref_face))
+            idx = (idx + 1) % len(gpus)
+
+        for gpu in gpus:
             roop.globals.gpu_job_queue[gpu].join()
+
         stop_gpu_workers()
+
         if update:
-            for _ in temp_frame_paths:
+            for _ in frame_paths:
                 update()
+
     except Exception as e:
         print("[MultiGPU] process_frames error:", e)
 
-def process_image(source_path, target_path, out_path):
+def process_image(sp, tp, out):
     try:
-        src = get_one_face(cv2.imread(source_path))
-        tgt = cv2.imread(target_path)
+        src = get_one_face(cv2.imread(sp))
+        tgt = cv2.imread(tp)
         ref = get_one_face(tgt)
-        result = process_frame_single_gpu(src, ref, tgt, 0)
-        cv2.imwrite(out_path, result)
+        res = process_frame_single_gpu(src, ref, tgt, 0)
+        cv2.imwrite(out, res)
     except:
         print("[face_swapper] process_image error")
 
-def process_video(source_path, temp_frame_paths):
+def process_video(source_path, frame_paths):
     try:
         if not roop.globals.many_faces and not get_face_reference():
-            rf = cv2.imread(temp_frame_paths[roop.globals.reference_frame_number])
+            rf = cv2.imread(frame_paths[roop.globals.reference_frame_number])
             set_face_reference(get_one_face(rf))
         roop.processors.frame.core.process_video(
             source_path,
-            temp_frame_paths,
+            frame_paths,
             process_frames
         )
     except Exception as e:
         print("[face_swapper] process_video error:", e)
 
+
 _required = [
     "NAME",
     "pre_check",
     "pre_start",
+    "process_frame",
     "process_frames",
     "process_image",
     "process_video",
     "post_process"
 ]
 
-_missing = [_ for _ in _required if _ not in globals()]
+_missing = [x for x in _required if x not in globals()]
 if _missing:
     raise ImportError(f"[face_swapper] Missing API: {_missing}")
 
